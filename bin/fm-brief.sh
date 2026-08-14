@@ -12,7 +12,9 @@
 #        fm-brief.sh --compact-return scout <task-id> [--claim <text> --result <text>]
 #          [--exact-evidence-or-command <text> --confidence <high|medium|low>]
 #          [--residual-risk <text>]
-#        fm-brief.sh --compact-return ship <task-id>
+#        fm-brief.sh --compact-return ship <task-id> --primary-routine
+#   Ship compaction requires the primary's explicit routine classification at render time;
+#   missing, uncertain, sensitive, or captain-designated context must expand instead.
 #   --compact-return is a view operation over the existing report, status, PR/head,
 #   branch/commit, checks, and keyed-decision artifacts; it never changes status or
 #   grants completion, approval, merge, discard, or cleanup authority.
@@ -118,6 +120,13 @@ compact_hash() {
   sha256sum "$1" | awk '{print $1}'
 }
 compact_meta() { awk -F= -v k="$2" '$1 == k {v=substr($0,index($0,"=")+1)} END {print v}' "$1"; }
+compact_pr_head() {
+  awk '
+    /^pr=/ { pr_seen++; next }
+    /^pr_head=/ { if (!pr_seen) bad=1; head_seen++; if (head_seen == 1) head=substr($0, 9); next }
+    END { if (pr_seen != 1 || bad || head_seen > 1) exit 1; if (head_seen == 1) print head }
+  ' "$1"
+}
 compact_keys() {
   local f=$STATE/$1.status open keys
   compact_file_ok "$f" || return 1
@@ -197,13 +206,17 @@ compact_scout_write() {
   tmp=$(mktemp "$DATA/$id/.report.XXXXXX") || { rm -f "$body"; compact_error "cannot stage compact report"; return 1; }
   compact_emit "$claim" "$result" "$evidence" "data/$id/report.md (body-sha256=$hash)" "$confidence" "$residual" "$decision" > "$tmp"
   printf '\n' >> "$tmp"; cat "$body" >> "$tmp"; rm -f "$body"
-  mode=$(stat -f '%Lp' "$report" 2>/dev/null || stat -c '%a' "$report" 2>/dev/null || true)
-  [ -z "$mode" ] || chmod "$mode" "$tmp"
+  if [ "$(uname)" = Darwin ]; then
+    mode=$(stat -f '%Lp' "$report" 2>/dev/null) || { rm -f "$tmp"; compact_error "cannot read report mode"; return 1; }
+  else
+    mode=$(stat -c '%a' "$report" 2>/dev/null) || { rm -f "$tmp"; compact_error "cannot read report mode"; return 1; }
+  fi
+  chmod "$mode" "$tmp" || { rm -f "$tmp"; compact_error "cannot preserve report mode"; return 1; }
   mv -f "$tmp" "$report" || { rm -f "$tmp"; compact_error "cannot publish compact report"; return 1; }
   sed -n '1,8p' "$report"
 }
 compact_ship_view() {
-  local id=$1 meta="$STATE/$1.meta" status="$STATE/$1.status" kind mode last verb open pr head wt local_head project branch current project_head pr_head_count claim result evidence artifact confidence residual status_lc
+  local id=$1 meta="$STATE/$1.meta" status="$STATE/$1.status" kind mode last verb note open pr head wt local_head project branch current project_head claim result evidence artifact confidence residual status_lc
   compact_id_ok "$id" || { compact_error "invalid task id"; return 1; }
   if ! compact_file_ok "$meta" || ! compact_file_ok "$status"; then
     compact_error "ship metadata or status is unavailable"
@@ -227,26 +240,28 @@ compact_ship_view() {
       current=$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null || true); [ "$current" = "$branch" ] || { compact_error "local branch artifact is stale"; return 1; }
       local_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null || true); [ "$local_head" = "$head" ] || { compact_error "local branch identity is contradictory"; return 1; }
     fi
-    case "$last" in *"$branch"*|*'ready in branch'*) ;; *) compact_error "terminal status does not identify the local branch"; return 1 ;; esac
+    note=$(status_line_note "$last"); [ "$note" = "ready in branch $branch" ] || { compact_error "terminal status does not identify the local branch"; return 1; }
     claim="local branch $branch identifies the delivery artifact"; result='ready in the recorded branch'; evidence="git -C $project rev-parse refs/heads/$branch"; artifact="branch=$branch (commit=$head; identity=verified)"
   else
     # shellcheck source=bin/fm-pr-lib.sh
     . "$SCRIPT_DIR/fm-pr-lib.sh"
     fm_pr_metadata_identity_parse "$meta" || { compact_error "PR metadata identity is malformed"; return 1; }
-    pr=$FM_PR_META_URL; head=$(compact_meta "$meta" pr_head); wt=$(compact_meta "$meta" worktree)
-    pr_head_count=$(grep -c '^pr_head=' "$meta" || true)
-    case "$FM_PR_META_PROVIDER:$pr_head_count" in
-      github:1) fm_pr_head_valid "$head" || { compact_error "PR head identity is missing or malformed"; return 1; } ;;
-      gitlab:0|gitlab:1) [ -z "$head" ] || fm_pr_head_valid "$head" || { compact_error "PR head identity is malformed"; return 1; } ;;
-      *) compact_error "PR head identity is missing or ambiguous"; return 1 ;;
+    pr=$FM_PR_META_URL; wt=$(compact_meta "$meta" worktree)
+    head=$(compact_pr_head "$meta") || { compact_error "PR head identity is missing, duplicate, or not associated with pr"; return 1; }
+    case "$FM_PR_META_PROVIDER:$head" in
+      github:) compact_error "PR head identity is missing or malformed"; return 1 ;;
+      github:*) fm_pr_head_valid "$head" || { compact_error "PR head identity is malformed"; return 1; } ;;
+      gitlab:) ;;
+      gitlab:*) fm_pr_head_valid "$head" || { compact_error "PR head identity is malformed"; return 1; } ;;
+      *) compact_error "PR provider identity is malformed"; return 1 ;;
     esac
     if [ -n "$head" ] && [ -n "$wt" ] && { [ -e "$wt" ] || [ -L "$wt" ]; }; then
       [ -d "$wt" ] && [ ! -L "$wt" ] || { compact_error "PR worktree identity is malformed"; return 1; }
       local_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)
       [ "$local_head" = "$head" ] || { compact_error "PR head is stale relative to the delivery branch"; return 1; }
     fi
-    case "$last" in *"$pr"*) ;; *) compact_error "terminal status contradicts the recorded PR"; return 1 ;; esac
-    [ "$mode" != no-mistakes ] || case "$status_lc" in *'checks green'*) ;; *) compact_error "no-mistakes checks are not reported green"; return 1 ;; esac
+    note=$(status_line_note "$last"); expected="PR $pr"; [ "$mode" = no-mistakes ] && expected="$expected checks green"
+    [ "$note" = "$expected" ] || { compact_error "terminal status contradicts the recorded PR"; return 1; }
     claim='the recorded PR identifies the delivery artifact'; result=$([ "$mode" = no-mistakes ] && printf 'checks green and PR ready' || printf 'PR ready for review'); evidence="state/$id.meta (pr, pr_head); state/$id.status"; artifact="$pr (pr_head=$head; identity=verified)"
     [ -n "$head" ] || artifact="$pr (identity=verified; pr_head=unrecorded)"
   fi
@@ -258,7 +273,7 @@ compact_return_dispatch() {
   [ "$#" -ge 2 ] || { compact_error 'usage: --compact-return scout <id> [fields] or ship <id>'; return 1; }
   case "$1" in
     scout) [ "$#" -ge 2 ] || return 1; if [ "$#" -eq 2 ]; then compact_scout_view "$2"; else id=$2; shift 2; compact_scout_write "$id" "$@"; fi ;;
-    ship) [ "$#" -eq 2 ] || { compact_error 'ship compact-return takes only a task id'; return 1; }; compact_ship_view "$2" ;;
+    ship) [ "$#" -eq 3 ] && [ "$3" = --primary-routine ] || { compact_error 'ship compact-return requires the primary-owned --primary-routine classification; expand otherwise'; return 1; }; compact_ship_view "$2" ;;
     *) compact_error "unknown compact-return kind $1"; return 1 ;;
   esac
 }
@@ -473,8 +488,9 @@ COMPACT_SECTION=$(printf '%s\n' \
 'For a scout, finish the complete report first, then run:' \
 "  \`$FM_ROOT/bin/fm-brief.sh --compact-return scout $ID --claim \"...\" --result \"...\" --exact-evidence-or-command \"...\" --confidence high --residual-risk \"none\"\`" \
 'This prepends the seven fields to `data/<id>/report.md`, records the complete report body identity, and derives `decision_required` from the authoritative keyed decision set.' \
-'For a ship, the primary renders the view after the terminal notification with:' \
-"  \`$FM_ROOT/bin/fm-brief.sh --compact-return ship $ID\`" \
+'For a ship, the primary must classify the context as routine at render time and use:' \
+"  \`$FM_ROOT/bin/fm-brief.sh --compact-return ship $ID --primary-routine\`" \
+'Only the primary may supply `--primary-routine`; missing, uncertain, sensitive, or captain-designated context must expand to the authoritative source.' \
 'It reconstructs PR URL/head and checks for PR modes, or branch/commit for local-only, from existing durable delivery artifacts.' \
 '`decision_required` is `none` only when the authoritative keyed open-decision set is empty; otherwise it identifies every matching durable key and never opens, answers, closes, transfers, or approves a decision.' \
 '`artifact` must identify the authoritative artifact and its existence and identity check.' \

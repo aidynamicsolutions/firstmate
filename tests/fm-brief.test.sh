@@ -691,7 +691,7 @@ test_scout_and_secondmate_load_decision_hold_policy() {
 }
 
 test_compact_return_artifacts_and_expansion() {
-  local home="$TMP_ROOT/compact-home" scout before out status id mode proj wt head url confidence
+  local home="$TMP_ROOT/compact-home" scout before out status id mode proj wt head url confidence good_status bad_status meta
   mkdir -p "$home/data" "$home/state"
   for kind in scout ship; do
     id="compact-contract-$kind"
@@ -701,6 +701,7 @@ test_compact_return_artifacts_and_expansion() {
     assert_grep "claim\`, \`result\`, \`exact_evidence_or_command\`, \`artifact\`, \`confidence\`, \`residual_risk\`, and \`decision_required\`" "$home/data/$id/brief.md" "$kind brief lost a compact field"
     assert_grep 'never put these fields in the status line' "$home/data/$id/brief.md" "$kind brief changed the sparse status protocol"
     assert_grep 'pointer-first later notifications belong to Phase 3b' "$home/data/$id/brief.md" "$kind brief crossed the Phase 3b boundary"
+    assert_contains "$(cat "$home/data/$id/brief.md")" '--primary-routine' "$kind brief lost the primary-owned routine classification"
   done
 
   scout=compact-scout
@@ -741,17 +742,32 @@ test_compact_return_artifacts_and_expansion() {
   if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout malformed >/dev/null 2>&1; then fail 'malformed compact return was accepted'; fi
   if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout missing-report >/dev/null 2>&1; then fail 'missing scout artifact was accepted'; fi
 
+  mkdir "$home/fakebin"; printf '%s\n' '#!/bin/sh' 'printf "Linux\\n"' > "$home/fakebin/uname"; chmod 755 "$home/fakebin/uname"
+  # shellcheck disable=SC2016 # Literal fake script must retain its positional parameter.
+  printf '%s\n' '#!/bin/sh' 'case "$1" in -c) printf "644\\n" ;; *) printf "File: fake\\n"; exit 1 ;; esac' > "$home/fakebin/stat"; chmod 755 "$home/fakebin/stat"
+  mkdir -p "$home/data/stat-scout"; printf 'done: report complete\n' > "$home/state/stat-scout.status"; printf '# Portable report\n' > "$home/data/stat-scout/report.md"
+  if PATH="$home/fakebin:$PATH" FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout stat-scout --claim claim --result result --exact-evidence-or-command command --confidence high --residual-risk none >/dev/null 2>&1; then :; else fail 'GNU stat mode handling rejected scout publication'; fi
+  assert_grep '## Compact return' "$home/data/stat-scout/report.md" 'GNU stat mode handling did not publish scout compact return'
+
   for mode in direct-PR no-mistakes; do
     id="compact-$mode"; proj="$TMP_ROOT/$id-project"; wt="$TMP_ROOT/$id-worktree"; url="https://github.com/aidynamicsolutions/firstmate/pull/42"
     mkdir -p "$home/data" "$home/state"; fm_git_worktree "$proj" "$wt" "fm/$id"; head=$(git -C "$wt" rev-parse HEAD)
     fm_write_meta "$home/state/$id.meta" "project=$proj" "worktree=$wt" "kind=ship" "mode=$mode" "pr=$url" "pr_head=$head"
-    if [ "$mode" = no-mistakes ]; then printf 'done: PR %s checks green\n' "$url" > "$home/state/$id.status"; else printf 'done: PR %s\n' "$url" > "$home/state/$id.status"; fi
-    out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id") || fail "$mode ship compact view failed"
+    if [ "$mode" = no-mistakes ]; then good_status="done: PR $url checks green"; else good_status="done: PR $url"; fi
+    printf '%s\n' "$good_status" > "$home/state/$id.status"
+    out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" --primary-routine) || fail "$mode ship compact view failed"
+    if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" >/dev/null 2>&1; then fail "$mode missing routine classification was accepted"; fi
+    if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" --primary-sensitive >/dev/null 2>&1; then fail "$mode sensitive classification was accepted"; fi
+    if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" --primary-captain >/dev/null 2>&1; then fail "$mode captain classification was accepted"; fi
     assert_contains "$out" "artifact: $url (pr_head=$head; identity=verified)" "$mode artifact identity was not authoritative"
-    before=$(cat "$home/state/$id.status"); FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" >/dev/null
+    before=$(cat "$home/state/$id.status"); FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" --primary-routine >/dev/null
     [ "$before" = "$(cat "$home/state/$id.status")" ] || fail "$mode compact view changed sparse status"
+    bad_status="done: PR ${url}0"; [ "$mode" = no-mistakes ] && bad_status="$bad_status checks green"
+    printf '%s\n' "$bad_status" > "$home/state/$id.status"
+    if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" --primary-routine >/dev/null 2>&1; then fail "$mode PR-prefix terminal status was accepted"; fi
+    printf '%s\n' "$good_status" > "$home/state/$id.status"
     printf 'contradictory\n' >> "$wt/file"; git -C "$wt" add file; git -C "$wt" commit -qm contradictory
-    if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" >/dev/null 2>&1; then fail "$mode stale PR head was accepted"; fi
+    if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" --primary-routine >/dev/null 2>&1; then fail "$mode stale PR head was accepted"; fi
   done
 
   id=compact-restart; proj="$TMP_ROOT/$id-project"; wt="$TMP_ROOT/$id-worktree"; url="https://github.com/aidynamicsolutions/firstmate/pull/43"
@@ -759,19 +775,23 @@ test_compact_return_artifacts_and_expansion() {
   fm_write_meta "$home/state/$id.meta" "project=$proj" "worktree=$wt" "kind=ship" "mode=direct-PR" "pr=$url" "pr_head=$head"
   printf 'done: PR %s\n' "$url" > "$home/state/$id.status"
   git -C "$proj" worktree remove --force "$wt" >/dev/null
-  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id") || fail 'ship restart reconstruction failed without worker worktree'
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" --primary-routine) || fail 'ship restart reconstruction failed without worker worktree'
   assert_contains "$out" "artifact: $url (pr_head=$head; identity=verified)" 'ship restart lost the durable PR identity'
 
   id=compact-local; proj="$TMP_ROOT/$id-project"; wt="$TMP_ROOT/$id-worktree"; fm_git_worktree "$proj" "$wt" "fm/$id"; head=$(git -C "$wt" rev-parse HEAD)
   fm_write_meta "$home/state/$id.meta" "project=$proj" "worktree=$wt" "kind=ship" 'mode=local-only'
   printf 'done: ready in branch fm/%s\n' "$id" > "$home/state/$id.status"
-  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id") || fail 'local-only compact view failed'
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" --primary-routine) || fail 'local-only compact view failed'
   assert_contains "$out" "artifact: branch=fm/$id (commit=$head; identity=verified)" 'local-only artifact identity was not authoritative'
-  git -C "$proj" worktree remove --force "$wt" >/dev/null
-  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id") || fail 'local-only restart reconstruction failed without worker worktree'
+  printf 'done: ready in branch fm/%s-other\n' "$id" > "$home/state/$id.status"; if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" --primary-routine >/dev/null 2>&1; then fail 'local branch-prefix terminal status was accepted'; fi
+  printf 'done: ready in branch fm/%s\n' "$id" > "$home/state/$id.status"; git -C "$proj" worktree remove --force "$wt" >/dev/null
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" --primary-routine) || fail 'local-only restart reconstruction failed without worker worktree'
   assert_contains "$out" "artifact: branch=fm/$id (commit=$head; identity=verified)" 'local-only restart lost the durable branch identity'
-  sed '/^pr_head=/d' "$home/state/compact-direct-PR.meta" > "$home/state/compact-direct-PR.meta.tmp"; mv "$home/state/compact-direct-PR.meta.tmp" "$home/state/compact-direct-PR.meta"
-  if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship compact-direct-PR >/dev/null 2>&1; then fail 'missing PR head artifact was accepted'; fi
+  meta="$home/state/compact-direct-PR.meta"; head=$(grep '^pr_head=' "$meta" | cut -d= -f2-)
+  { printf 'pr_head=%s\n' "$head"; grep -v '^pr_head=' "$meta"; } > "$meta.tmp"; mv "$meta.tmp" "$meta"
+  if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship compact-direct-PR --primary-routine >/dev/null 2>&1; then fail 'pre-PR head artifact was accepted'; fi
+  sed '/^pr_head=/d' "$meta" > "$meta.tmp"; mv "$meta.tmp" "$meta"
+  if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship compact-direct-PR --primary-routine >/dev/null 2>&1; then fail 'missing PR head artifact was accepted'; fi
   pass 'fm-brief.sh: compact scout and ship views preserve artifacts, decisions, and expansion rules'
 }
 

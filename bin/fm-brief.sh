@@ -9,6 +9,13 @@
 # Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--herdr-lab]
 #        fm-brief.sh <task-id> <repo-name> --scout [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
+#        fm-brief.sh --compact-return scout <task-id> [--claim <text> --result <text>]
+#          [--exact-evidence-or-command <text> --confidence <high|medium|low>]
+#          [--residual-risk <text>]
+#        fm-brief.sh --compact-return ship <task-id>
+#   --compact-return is a view operation over the existing report, status, PR/head,
+#   branch/commit, checks, and keyed-decision artifacts; it never changes status or
+#   grants completion, approval, merge, discard, or cleanup authority.
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
 #   --secondmate writes a persistent secondmate charter. The project list
@@ -100,6 +107,165 @@ if [ -n "${FM_STATE_OVERRIDE:-}" ]; then
   STATE=$(resolve_directory_input FM_STATE_OVERRIDE "$FM_STATE_OVERRIDE") || exit 1
 else
   STATE="$FM_HOME/state"
+fi
+
+compact_error() { printf 'compact return: EXPAND: %s\n' "$1" >&2; return 1; }
+compact_id_ok() { case "$1" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac; }
+compact_file_ok() { [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ]; }
+compact_hash() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'; return; fi
+  command -v sha256sum >/dev/null 2>&1 || return 1
+  sha256sum "$1" | awk '{print $1}'
+}
+compact_meta() { awk -F= -v k="$2" '$1 == k {v=substr($0,index($0,"=")+1)} END {print v}' "$1"; }
+compact_keys() {
+  local f=$STATE/$1.status open keys
+  compact_file_ok "$f" || return 1
+  open=$(status_open_decisions "$f")
+  [ -n "$open" ] || { printf 'none\n'; return 0; }
+  keys=$(printf '%s\n' "$open" | awk -F '\t' 'NF {print $1}' | LC_ALL=C sort -u | paste -sd, -)
+  [ -n "$keys" ] && printf '%s\n' "$keys"
+}
+compact_field() {
+  case "$2" in "$1"*) printf '%s' "${2#"$1"}" ;; *) return 1 ;; esac
+}
+compact_emit() {
+  printf '## Compact return\nclaim: %s\nresult: %s\nexact_evidence_or_command: %s\nartifact: %s\nconfidence: %s\nresidual_risk: %s\ndecision_required: %s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+}
+compact_scout_view() {
+  local id=$1 report="$DATA/$1/report.md" claim result evidence artifact confidence residual decision expected prefix hash body actual status_lc value
+  compact_id_ok "$id" || { compact_error "invalid task id"; return 1; }
+  compact_file_ok "$report" || { compact_error "missing authoritative report $report"; return 1; }
+  [ "$(sed -n '1p' "$report")" = '## Compact return' ] || { compact_error "report has no top compact return"; return 1; }
+  claim=$(compact_field 'claim: ' "$(sed -n '2p' "$report")") || { compact_error "malformed claim field"; return 1; }
+  result=$(compact_field 'result: ' "$(sed -n '3p' "$report")") || { compact_error "malformed result field"; return 1; }
+  evidence=$(compact_field 'exact_evidence_or_command: ' "$(sed -n '4p' "$report")") || { compact_error "malformed evidence field"; return 1; }
+  artifact=$(compact_field 'artifact: ' "$(sed -n '5p' "$report")") || { compact_error "malformed artifact field"; return 1; }
+  confidence=$(compact_field 'confidence: ' "$(sed -n '6p' "$report")") || { compact_error "malformed confidence field"; return 1; }
+  residual=$(compact_field 'residual_risk: ' "$(sed -n '7p' "$report")") || { compact_error "malformed residual-risk field"; return 1; }
+  decision=$(compact_field 'decision_required: ' "$(sed -n '8p' "$report")") || { compact_error "malformed decision field"; return 1; }
+  [ -z "$(sed -n '9p' "$report")" ] || { compact_error "compact return is not separated from the report"; return 1; }
+  for value in "$claim" "$result" "$evidence" "$confidence" "$residual" "$decision"; do
+    [ -n "$value" ] || { compact_error "compact fields cannot be empty"; return 1; }
+  done
+  case "$confidence" in high|medium|low) ;; *) compact_error "confidence is malformed"; return 1 ;; esac
+  prefix="data/$id/report.md (body-sha256="
+  case "$artifact" in "$prefix"*) ;; *) compact_error "artifact does not identify data/$id/report.md"; return 1 ;; esac
+  hash=${artifact#"$prefix"}; case "$hash" in *')') hash=${hash%)} ;; *) compact_error "artifact identity is malformed"; return 1 ;; esac
+  [ "${#hash}" -eq 64 ] || { compact_error "artifact identity is malformed"; return 1; }
+  case "$hash" in *[!0-9a-f]*) compact_error "artifact identity is malformed"; return 1 ;; esac
+  body=$(mktemp "$DATA/$id/.compact-body.XXXXXX") || { compact_error "cannot stage report identity"; return 1; }
+  tail -n +10 "$report" > "$body" || { rm -f "$body"; compact_error "cannot read complete report"; return 1; }
+  actual=$(compact_hash "$body" || true); rm -f "$body"
+  [ "$actual" = "$hash" ] || { compact_error "report body changed after the compact return"; return 1; }
+  expected=$(compact_keys "$id") || { compact_error "authoritative decision set is unavailable"; return 1; }
+  [ "$decision" = "$expected" ] || { compact_error "decision_required disagrees with keyed decisions"; return 1; }
+  compact_emit "$claim" "$result" "$evidence" "$artifact" "$confidence" "$residual" "$decision"
+  status_lc=$(printf '%s' "$claim $result $evidence $residual" | tr '[:upper:]' '[:lower:]')
+  case "$confidence:$decision:$status_lc" in
+    high:none:*security*|high:none:*financial*|high:none:*destruct*|high:none:*irrevers*|high:none:*privacy*|high:none:*captain*|high:none:*merge*|high:none:*discard*|high:none:*cleanup*|high:none:*contradict*|high:none:*stale*) compact_error "sensitive or authority-bound result requires the complete report"; return 1 ;;
+    high:none:*) return 0 ;;
+    *) compact_error "low-confidence or decision-bearing result requires the complete report"; return 1 ;;
+  esac
+}
+compact_scout_write() {
+  local id=$1 report="$DATA/$1/report.md" claim result evidence confidence residual decision body hash tmp mode
+  claim=''; result=''; evidence=''; confidence=''; residual=''
+  shift
+  while [ "$#" -gt 0 ]; do
+    [ "$#" -ge 2 ] || { compact_error "$1 requires a value"; return 1; }
+    case "$1" in
+      --claim) claim=$2 ;; --result) result=$2 ;; --exact-evidence-or-command) evidence=$2 ;;
+      --confidence) confidence=$2 ;; --residual-risk) residual=$2 ;;
+      *) compact_error "unknown scout compact-return option $1"; return 1 ;;
+    esac
+    shift 2
+  done
+  compact_id_ok "$id" || { compact_error "invalid task id"; return 1; }
+  compact_file_ok "$report" || { compact_error "missing authoritative report $report"; return 1; }
+  [ "$(sed -n '1p' "$report")" != '## Compact return' ] || { compact_error "report already has a compact return; inspect it before rewriting"; return 1; }
+  for value in "$claim" "$result" "$evidence" "$confidence" "$residual"; do
+    [ -n "$value" ] || { compact_error "compact fields cannot be empty"; return 1; }
+    case "$value" in *$'\n'*|*$'\r'*) compact_error "compact fields must be one line"; return 1 ;; esac
+  done
+  case "$confidence" in high|medium|low) ;; *) compact_error "confidence must be high, medium, or low"; return 1 ;; esac
+  decision=$(compact_keys "$id") || { compact_error "authoritative decision set is unavailable"; return 1; }
+  body=$(mktemp "$DATA/$id/.compact-body.XXXXXX") || { compact_error "cannot stage report"; return 1; }
+  cat "$report" > "$body" || { rm -f "$body"; compact_error "cannot read complete report"; return 1; }
+  grep -q '[^[:space:]]' "$body" || { rm -f "$body"; compact_error "complete report is empty"; return 1; }
+  hash=$(compact_hash "$body" || true); [ -n "$hash" ] || { rm -f "$body"; compact_error "SHA-256 is unavailable"; return 1; }
+  tmp=$(mktemp "$DATA/$id/.report.XXXXXX") || { rm -f "$body"; compact_error "cannot stage compact report"; return 1; }
+  compact_emit "$claim" "$result" "$evidence" "data/$id/report.md (body-sha256=$hash)" "$confidence" "$residual" "$decision" > "$tmp"
+  printf '\n' >> "$tmp"; cat "$body" >> "$tmp"; rm -f "$body"
+  mode=$(stat -f '%Lp' "$report" 2>/dev/null || stat -c '%a' "$report" 2>/dev/null || true)
+  [ -z "$mode" ] || chmod "$mode" "$tmp"
+  mv -f "$tmp" "$report" || { rm -f "$tmp"; compact_error "cannot publish compact report"; return 1; }
+  sed -n '1,8p' "$report"
+}
+compact_ship_view() {
+  local id=$1 meta="$STATE/$1.meta" status="$STATE/$1.status" kind mode last verb open pr head wt local_head project branch current project_head pr_head_count claim result evidence artifact confidence residual status_lc
+  compact_id_ok "$id" || { compact_error "invalid task id"; return 1; }
+  if ! compact_file_ok "$meta" || ! compact_file_ok "$status"; then
+    compact_error "ship metadata or status is unavailable"
+    return 1
+  fi
+  kind=$(compact_meta "$meta" kind); [ -z "$kind" ] || [ "$kind" = ship ] || { compact_error "task is not a ship task"; return 1; }
+  mode=$(compact_meta "$meta" mode); case "$mode" in no-mistakes|direct-PR|local-only) ;; *) compact_error "ship delivery mode is unavailable"; return 1 ;; esac
+  last=$(last_status_line "$status"); verb=$(status_line_verb "$last"); [ "$verb" = "done" ] || { compact_error "terminal status is not done"; return 1; }
+  open=$(compact_keys "$id") || { compact_error "authoritative decision set is unavailable"; return 1; }
+  confidence=high; residual='delivery authority remains with the existing review, landing, and cleanup owners'
+  status_lc=$(printf '%s' "$last" | tr '[:upper:]' '[:lower:]')
+  case "$status_lc" in *security*|*financial*|*destruct*|*irrevers*|*privacy*|*captain*|*merge*|*discard*|*cleanup*|*contradict*|*stale*) confidence=medium ;; esac
+  if [ "$mode" = local-only ]; then
+    project=$(compact_meta "$meta" project); wt=$(compact_meta "$meta" worktree); branch="fm/$id"
+    [ -d "$project" ] && [ ! -L "$project" ] || { compact_error "local branch artifact is missing"; return 1; }
+    project_head=$(git -C "$project" rev-parse --verify "refs/heads/fm/$id" 2>/dev/null || true)
+    [ -n "$project_head" ] || { compact_error "local branch artifact is missing"; return 1; }
+    branch="fm/$id"; head=$project_head
+    if [ -n "$wt" ] && { [ -e "$wt" ] || [ -L "$wt" ]; }; then
+      [ -d "$wt" ] && [ ! -L "$wt" ] || { compact_error "local branch worktree identity is malformed"; return 1; }
+      current=$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null || true); [ "$current" = "$branch" ] || { compact_error "local branch artifact is stale"; return 1; }
+      local_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null || true); [ "$local_head" = "$head" ] || { compact_error "local branch identity is contradictory"; return 1; }
+    fi
+    case "$last" in *"$branch"*|*'ready in branch'*) ;; *) compact_error "terminal status does not identify the local branch"; return 1 ;; esac
+    claim="local branch $branch identifies the delivery artifact"; result='ready in the recorded branch'; evidence="git -C $project rev-parse refs/heads/$branch"; artifact="branch=$branch (commit=$head; identity=verified)"
+  else
+    # shellcheck source=bin/fm-pr-lib.sh
+    . "$SCRIPT_DIR/fm-pr-lib.sh"
+    fm_pr_metadata_identity_parse "$meta" || { compact_error "PR metadata identity is malformed"; return 1; }
+    pr=$FM_PR_META_URL; head=$(compact_meta "$meta" pr_head); wt=$(compact_meta "$meta" worktree)
+    pr_head_count=$(grep -c '^pr_head=' "$meta" || true)
+    case "$FM_PR_META_PROVIDER:$pr_head_count" in
+      github:1) fm_pr_head_valid "$head" || { compact_error "PR head identity is missing or malformed"; return 1; } ;;
+      gitlab:0|gitlab:1) [ -z "$head" ] || fm_pr_head_valid "$head" || { compact_error "PR head identity is malformed"; return 1; } ;;
+      *) compact_error "PR head identity is missing or ambiguous"; return 1 ;;
+    esac
+    if [ -n "$head" ] && [ -n "$wt" ] && { [ -e "$wt" ] || [ -L "$wt" ]; }; then
+      [ -d "$wt" ] && [ ! -L "$wt" ] || { compact_error "PR worktree identity is malformed"; return 1; }
+      local_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)
+      [ "$local_head" = "$head" ] || { compact_error "PR head is stale relative to the delivery branch"; return 1; }
+    fi
+    case "$last" in *"$pr"*) ;; *) compact_error "terminal status contradicts the recorded PR"; return 1 ;; esac
+    [ "$mode" != no-mistakes ] || case "$status_lc" in *'checks green'*) ;; *) compact_error "no-mistakes checks are not reported green"; return 1 ;; esac
+    claim='the recorded PR identifies the delivery artifact'; result=$([ "$mode" = no-mistakes ] && printf 'checks green and PR ready' || printf 'PR ready for review'); evidence="state/$id.meta (pr, pr_head); state/$id.status"; artifact="$pr (pr_head=$head; identity=verified)"
+    [ -n "$head" ] || artifact="$pr (identity=verified; pr_head=unrecorded)"
+  fi
+  [ "$open" = none ] || { confidence=medium; residual="authoritative decision keys require expansion: $open"; }
+  compact_emit "$claim" "$result" "$evidence" "$artifact" "$confidence" "$residual" "$open"
+  [ "$confidence" = high ] || { compact_error "decision-bearing or sensitive ship result requires authoritative expansion"; return 1; }
+}
+compact_return_dispatch() {
+  [ "$#" -ge 2 ] || { compact_error 'usage: --compact-return scout <id> [fields] or ship <id>'; return 1; }
+  case "$1" in
+    scout) [ "$#" -ge 2 ] || return 1; if [ "$#" -eq 2 ]; then compact_scout_view "$2"; else id=$2; shift 2; compact_scout_write "$id" "$@"; fi ;;
+    ship) [ "$#" -eq 2 ] || { compact_error 'ship compact-return takes only a task id'; return 1; }; compact_ship_view "$2" ;;
+    *) compact_error "unknown compact-return kind $1"; return 1 ;;
+  esac
+}
+if [ "${1:-}" = '--compact-return' ]; then
+  shift
+  compact_return_dispatch "$@"
+  exit $?
 fi
 KIND=ship
 HERDR_LAB=0
@@ -298,6 +464,24 @@ EOF
 HERDR_SECTION=${HERDR_SECTION%$'\n'}
 fi
 
+# shellcheck disable=SC2016 # Backticks and field names are literal generated brief prose.
+COMPACT_SECTION=$(printf '%s\n' \
+'# Compact terminal return' \
+'The compact return is a view, never an authority record or a status transition.' \
+'It has exactly these seven fields: `claim`, `result`, `exact_evidence_or_command`, `artifact`, `confidence`, `residual_risk`, and `decision_required`.' \
+'Keep every terminal status event as the existing sparse one-line protocol; never put these fields in the status line.' \
+'For a scout, finish the complete report first, then run:' \
+"  \`$FM_ROOT/bin/fm-brief.sh --compact-return scout $ID --claim \"...\" --result \"...\" --exact-evidence-or-command \"...\" --confidence high --residual-risk \"none\"\`" \
+'This prepends the seven fields to `data/<id>/report.md`, records the complete report body identity, and derives `decision_required` from the authoritative keyed decision set.' \
+'For a ship, the primary renders the view after the terminal notification with:' \
+"  \`$FM_ROOT/bin/fm-brief.sh --compact-return ship $ID\`" \
+'It reconstructs PR URL/head and checks for PR modes, or branch/commit for local-only, from existing durable delivery artifacts.' \
+'`decision_required` is `none` only when the authoritative keyed open-decision set is empty; otherwise it identifies every matching durable key and never opens, answers, closes, transfers, or approves a decision.' \
+'`artifact` must identify the authoritative artifact and its existence and identity check.' \
+'Missing, malformed, stale, contradictory, low-confidence, decision-bearing, security-sensitive, destructive, irreversible, privacy-sensitive, merge/discard-related, or captain-requested results require expansion to the authoritative source and never authorize completion, approval, merge, discard, or cleanup.' \
+'This phase preserves the first complete scout report read and all existing later report-reread behavior; pointer-first later notifications belong to Phase 3b.' \
+)
+
 if [ "$KIND" = scout ]; then
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -335,6 +519,8 @@ The report is the only thing that survives, so anything worth keeping must be in
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+
+$COMPACT_SECTION
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -458,6 +644,8 @@ Record only project knowledge useful to almost every future session.
 For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
 If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+
+$COMPACT_SECTION
 
 $DOD
 EOF

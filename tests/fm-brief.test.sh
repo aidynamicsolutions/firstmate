@@ -690,6 +690,91 @@ test_scout_and_secondmate_load_decision_hold_policy() {
   pass "fm-brief.sh: investigation and visual-review completions load the shared decision policy"
 }
 
+test_compact_return_artifacts_and_expansion() {
+  local home="$TMP_ROOT/compact-home" scout before out status id mode proj wt head url confidence
+  mkdir -p "$home/data" "$home/state"
+  for kind in scout ship; do
+    id="compact-contract-$kind"
+    if [ "$kind" = scout ]; then FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" sample --scout >/dev/null 2>&1
+    else FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" sample --mode direct-PR >/dev/null 2>&1
+    fi
+    assert_grep "claim\`, \`result\`, \`exact_evidence_or_command\`, \`artifact\`, \`confidence\`, \`residual_risk\`, and \`decision_required\`" "$home/data/$id/brief.md" "$kind brief lost a compact field"
+    assert_grep 'never put these fields in the status line' "$home/data/$id/brief.md" "$kind brief changed the sparse status protocol"
+    assert_grep 'pointer-first later notifications belong to Phase 3b' "$home/data/$id/brief.md" "$kind brief crossed the Phase 3b boundary"
+  done
+
+  scout=compact-scout
+  mkdir -p "$home/data/$scout"
+  printf 'done: report complete\n' > "$home/state/$scout.status"
+  printf '# Complete scout report\n\nEvidence stays authoritative.\n' > "$home/data/$scout/report.md"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout "$scout" \
+    --claim 'report is complete' --result 'findings recorded' --exact-evidence-or-command 'tests/focused' \
+    --confidence high --residual-risk none) || fail 'scout compact writer failed'
+  assert_contains "$out" 'decision_required: none' 'scout compact writer did not derive an empty decision set'
+  [ "$(sed -n '1p' "$home/data/$scout/report.md")" = '## Compact return' ] || fail 'scout compact return was not at report top'
+  assert_grep '# Complete scout report' "$home/data/$scout/report.md" 'complete scout report was not preserved'
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout "$scout") || fail 'scout restart reconstruction failed'
+  assert_contains "$out" 'artifact: data/compact-scout/report.md (body-sha256=' 'scout artifact identity was not rendered'
+  before=$(cat "$home/state/$scout.status")
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout "$scout" >/dev/null 2>&1 || true
+  [ "$before" = "$(cat "$home/state/$scout.status")" ] || fail 'compact view changed sparse status events'
+  printf 'contradictory later body\n' >> "$home/data/$scout/report.md"
+  if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout "$scout" >/dev/null 2>&1; then fail 'stale scout artifact was accepted'; fi
+
+  for pair in 'decision:needs-decision [key=choice]: choose A' 'low:done:low confidence' 'security:done:security review'; do
+    id=${pair%%:*}; status=${pair#*:}; mkdir -p "$home/data/$id"
+    printf '%s\n' "$status" > "$home/state/$id.status"
+    printf '# Full %s report\n' "$id" > "$home/data/$id/report.md"
+    confidence=high; [ "$id" = low ] && confidence=low
+    out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout "$id" \
+      --claim "$id claim" --result 'report exists' --exact-evidence-or-command 'read report' \
+      --confidence "$confidence" --residual-risk none) || fail "$id compact writer failed"
+    case "$id" in
+      decision) assert_contains "$out" 'decision_required: choice' 'open keyed decision was omitted' ;;
+      low) if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout "$id" >/dev/null 2>&1; then fail 'low-confidence compact return did not expand'; fi ;;
+      security) if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout "$id" >/dev/null 2>&1; then fail 'security-sensitive compact return did not expand'; fi ;;
+    esac
+  done
+  mkdir -p "$home/data/malformed"
+  printf '## Compact return\nclaim: incomplete\n' > "$home/data/malformed/report.md"
+  printf 'done: report complete\n' > "$home/state/malformed.status"
+  if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout malformed >/dev/null 2>&1; then fail 'malformed compact return was accepted'; fi
+  if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return scout missing-report >/dev/null 2>&1; then fail 'missing scout artifact was accepted'; fi
+
+  for mode in direct-PR no-mistakes; do
+    id="compact-$mode"; proj="$TMP_ROOT/$id-project"; wt="$TMP_ROOT/$id-worktree"; url="https://github.com/aidynamicsolutions/firstmate/pull/42"
+    mkdir -p "$home/data" "$home/state"; fm_git_worktree "$proj" "$wt" "fm/$id"; head=$(git -C "$wt" rev-parse HEAD)
+    fm_write_meta "$home/state/$id.meta" "project=$proj" "worktree=$wt" "kind=ship" "mode=$mode" "pr=$url" "pr_head=$head"
+    if [ "$mode" = no-mistakes ]; then printf 'done: PR %s checks green\n' "$url" > "$home/state/$id.status"; else printf 'done: PR %s\n' "$url" > "$home/state/$id.status"; fi
+    out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id") || fail "$mode ship compact view failed"
+    assert_contains "$out" "artifact: $url (pr_head=$head; identity=verified)" "$mode artifact identity was not authoritative"
+    before=$(cat "$home/state/$id.status"); FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" >/dev/null
+    [ "$before" = "$(cat "$home/state/$id.status")" ] || fail "$mode compact view changed sparse status"
+    printf 'contradictory\n' >> "$wt/file"; git -C "$wt" add file; git -C "$wt" commit -qm contradictory
+    if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id" >/dev/null 2>&1; then fail "$mode stale PR head was accepted"; fi
+  done
+
+  id=compact-restart; proj="$TMP_ROOT/$id-project"; wt="$TMP_ROOT/$id-worktree"; url="https://github.com/aidynamicsolutions/firstmate/pull/43"
+  fm_git_worktree "$proj" "$wt" "fm/$id"; head=$(git -C "$wt" rev-parse HEAD)
+  fm_write_meta "$home/state/$id.meta" "project=$proj" "worktree=$wt" "kind=ship" "mode=direct-PR" "pr=$url" "pr_head=$head"
+  printf 'done: PR %s\n' "$url" > "$home/state/$id.status"
+  git -C "$proj" worktree remove --force "$wt" >/dev/null
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id") || fail 'ship restart reconstruction failed without worker worktree'
+  assert_contains "$out" "artifact: $url (pr_head=$head; identity=verified)" 'ship restart lost the durable PR identity'
+
+  id=compact-local; proj="$TMP_ROOT/$id-project"; wt="$TMP_ROOT/$id-worktree"; fm_git_worktree "$proj" "$wt" "fm/$id"; head=$(git -C "$wt" rev-parse HEAD)
+  fm_write_meta "$home/state/$id.meta" "project=$proj" "worktree=$wt" "kind=ship" 'mode=local-only'
+  printf 'done: ready in branch fm/%s\n' "$id" > "$home/state/$id.status"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id") || fail 'local-only compact view failed'
+  assert_contains "$out" "artifact: branch=fm/$id (commit=$head; identity=verified)" 'local-only artifact identity was not authoritative'
+  git -C "$proj" worktree remove --force "$wt" >/dev/null
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship "$id") || fail 'local-only restart reconstruction failed without worker worktree'
+  assert_contains "$out" "artifact: branch=fm/$id (commit=$head; identity=verified)" 'local-only restart lost the durable branch identity'
+  sed '/^pr_head=/d' "$home/state/compact-direct-PR.meta" > "$home/state/compact-direct-PR.meta.tmp"; mv "$home/state/compact-direct-PR.meta.tmp" "$home/state/compact-direct-PR.meta"
+  if FM_HOME="$home" "$ROOT/bin/fm-brief.sh" --compact-return ship compact-direct-PR >/dev/null 2>&1; then fail 'missing PR head artifact was accepted'; fi
+  pass 'fm-brief.sh: compact scout and ship views preserve artifacts, decisions, and expansion rules'
+}
+
 # Scout and secondmate paths still scaffold well-formed briefs.
 test_scout_and_secondmate_scaffold() {
   local brief
@@ -729,4 +814,5 @@ test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
+test_compact_return_artifacts_and_expansion
 test_scout_and_secondmate_scaffold

@@ -400,7 +400,7 @@ Durable acknowledgement and presentation contracts make duplicate notifications 
 At a scout's material completion, read and relay the authoritative complete report once; that first complete read remains the report's initial handling boundary.
 For later notifications, start with the existing report pointer, compact-return artifact identity, evidence or change information, and durable PR/head identity before opening the full report again.
 An unchanged duplicate notification does not reread the report or repeat a captain-facing action; missing artifacts, changed or malformed artifact identities or evidence, contradictions, changed PR heads, low confidence, unresolved decisions, security, financial, destructive, irreversible, privacy, merge, discard, or captain requests require expansion to the authoritative full report.
-Reconstruct those existing pointers and identities from the durable snapshot, compact return, and delivery records after compaction or session restart rather than relying on conversation memory.
+Reconstruct those existing pointers and identities from the existing structured fleet view, compact return, and delivery records after compaction or session restart rather than relying on conversation memory.
 Pointer-first is only a read-order rule: the authoritative report and all existing completion, decision, approval, merge, discard, cleanup, and captain-authority rules remain unchanged.
 
 Handle actionable wakes as follows:

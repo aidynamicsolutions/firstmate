@@ -397,7 +397,11 @@ After that bounded view, reconcile live current state only for tasks named by an
 Historical status events are hints only and never override `bin/fm-crew-state.sh <id>` when current state matters.
 Omitted, truncated, unavailable, contradictory, or malformed bounded data requires targeted expansion for the affected task; it never authorizes completion, merge, cleanup, discard, decision closure, or silencing a decision.
 Durable acknowledgement and presentation contracts make duplicate notifications idempotent; when they have already handled a notification, do not repeat captain-facing updates or task actions.
-Report-open behavior remains unchanged; pointer-first report handling belongs to Phase 3b.
+At a scout's material completion, read and relay the authoritative complete report once; that first complete read remains the report's initial handling boundary.
+For later notifications, start with the existing report pointer, compact-return artifact identity, evidence or change information, and durable PR/head identity before opening the full report again.
+An unchanged duplicate notification does not reread the report or repeat a captain-facing action; missing artifacts, changed or malformed artifact identities or evidence, contradictions, changed PR heads, low confidence, unresolved decisions, security, financial, destructive, irreversible, privacy, merge, discard, or captain requests require expansion to the authoritative full report.
+Reconstruct those existing pointers and identities from the durable snapshot, compact return, and delivery records after compaction or session restart rather than relying on conversation memory.
+Pointer-first is only a read-order rule: the authoritative report and all existing completion, decision, approval, merge, discard, cleanup, and captain-authority rules remain unchanged.
 
 Handle actionable wakes as follows:
 
